@@ -37,7 +37,24 @@ case "$CMD" in
     echo "── profile: $(basename "$ENV_FILE")"
     echo "   ctx=$CTX  gmu=$GPU_MEM_UTIL  kv=${KV_BYTES:-(GMU-driven)}  mtp=$MTP"
     echo "   extra_args=${EXTRA_ARGS:-<none>}  allow_long=$ALLOW_LONG  ple_prefetch=$PLE_PREFETCH"
-    exec "$HERE/tp2-serve.sh"
+    "$HERE/tp2-serve.sh"
+    # Post-boot: release the dead checkpoint-shard pages. The 127 GB load streams through the page
+    # cache AFTER the PLE prewarm, so those (now useless) pages outrank the table in the LRU and
+    # crowd it out. Dropping them measured +4 points of table residency (73% -> 77%). Safe: the
+    # table's own pages simply re-fault on demand at mmap speed.
+    if [ "${SKIP_DROP_CACHES:-0}" != "1" ]; then
+      echo "── waiting for health before releasing dead cache…"
+      for _ in $(seq 1 60); do
+        curl -s --max-time 3 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1 && break
+        sleep 5
+      done
+      if docker run --rm --privileged -v /proc:/hostproc alpine:latest \
+           sh -c 'sync; echo 3 > /hostproc/sys/vm/drop_caches' >/dev/null 2>&1; then
+        echo "   dead shard cache released (table re-faults on demand at mmap speed)"
+      else
+        echo "   note: drop_caches skipped (needs a privileged container) — residency will be lower"
+      fi
+    fi
     ;;
 
   stop)

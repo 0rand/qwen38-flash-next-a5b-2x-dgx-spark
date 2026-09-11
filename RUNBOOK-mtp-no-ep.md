@@ -214,3 +214,189 @@ Prefill is unaffected (~859–1,243 vs 1,001–1,198 t/s) — it is purely the M
    (explicit `-:<regex>` exclusions shadowed by an automatic shape fallback) is documented.
 3. Upstream issue material: the same shadowing affects any GPTQ MoE model whose per-rank expert
    intermediate is not group-aligned — not just this checkpoint.
+
+---
+
+## 13. KV PIN + RAM-RESIDENT PLE — measured 2026-09-11 (profile `a5b-tp2-ple-pin.env`)
+
+Boot: `./ctrl.sh start config/a5b-tp2-ple-pin.env` — 512K ctx, EP, MTP3, `GPU_MEM_UTIL=0.01`,
+`KV_BYTES=20g`. Boot clean, all gates pass, prefix cache +17,600.
+
+**What the pin bought (host side):**
+
+| | GMU 0.85 (1M profile) | pin (this run) |
+|---|---|---|
+| host used / free | 107 / 3 GB | **54 / 43 GB** |
+| page cache | 16.1 GB | **46.6 GB → then 43.2 GB under load** |
+| PLE table cached | 22% | **~95-100%** |
+| PLE gather ms/row | 0.124-0.137 | **0.025 idle / 0.083 loaded** |
+
+**Capacity:** `GPU KV cache size: 1,326,493 tokens`, 2.53x concurrency at 524,288 — matches the
+predicted ~1.3M from the budget table exactly.
+
+**Throughput (pp2048/tg1024):**
+
+| depth | c1 tg | c2 | c4 | c1 pp | c1 TTFT |
+|---|---|---|---|---|---|
+| d0 | 29.6 | 63.8 | 85.7 | 2,266 | 1,102 ms |
+| d2048 | 26.9 | 52.9 | 77.5 | 2,262 | 2,009 ms |
+| d8192 | 34.3 | 52.1 | 69.3 | 3,031 | 3,571 ms |
+
+Prefill 2,266-3,031 t/s and TTFT are ~2.3x better than the 1M/GMU-0.85 baseline (1,001-1,198 t/s,
+8,833 ms at d8192).
+
+### ⚠️ NOT ATTRIBUTABLE — two variables moved
+
+This run differs from the baseline in **two** ways: context (1M → 512K) **and** memory mode
+(GMU-filled → pin). The c1 decode figure (29.6 vs 45.3) therefore cannot be blamed on the pin, and
+the prefill gain cannot be credited to it either — the smaller YaRN factor (2.0 vs 4.0) is a
+plausible contributor.
+
+A third hypothesis worth stating so it is not lost: the 45.6 GiB resident table lives in the same
+**unified LPDDR5X pool** the GPU reads from, so host residency may cost decode memory bandwidth
+while leaving compute-bound prefill alone. That would explain the shape of these numbers — but it
+is a hypothesis, not a finding.
+
+**The clean test (one variable, both at 512K + EP):**
+```
+arm 1: config/a5b-tp2-512k-ep.env    512K, GMU 0.83   (table partly cached)
+arm 2: config/a5b-tp2-ple-pin.env    512K, GMU 0.01 + KV 20g  (table resident)
+```
+
+### 13.1 Attribution RESOLVED (Primo's c1 run, same profile)
+
+| depth | pp t/s | tg t/s | TTFT |
+|---|---|---|---|
+| d0 | 3,670 | 40.8 | 760 ms |
+| d2048 | 2,526 | 40.1 | 1,830 ms |
+| d8192 | 2,695 | 36.0 | 4,006 ms |
+
+Against the 1M/GMU-0.85 baseline (pp 1,001-1,198, tg 43.4-45.3, TTFT 8,833 ms at d8192):
+**prefill ~3x, decode unchanged.**
+
+* The earlier "decode 29.6 vs 45.3" concern was **run-to-run variance**, not a residency penalty —
+  the same config measured 40.8 here. Retired.
+* No decode penalty from host-resident table data; the unified-memory bandwidth hypothesis is not
+  supported.
+
+**Mechanism (from the engine's own PLE telemetry):**
+
+```
+rows/op=3646.1   gather 3.36 us/row    <- PREFILL: one PLE row per prompt token
+rows/op= 255.1   gather 25.29 us/row   <- decode steps
+rows/op=  65.1   gather 43.15 us/row   <- decode steps
+```
+
+Prefill gathers a row for **every prompt token** in a single op. That path was reading NVMe; it is
+now RAM-resident at ~3.4 us/row. Decode gathers only tens-to-hundreds of rows per step, so it
+barely noticed the change. **The win is entirely on the prefill side — which is exactly where it
+matters for long-context work.**
+
+### Remaining lever, now evidence-backed
+
+Decode gathers run at 22-43 us/row versus 3.36 us/row for the batched prefill op — a ~10x per-row
+gap that is *not* I/O (the table is resident). That is latency/machinery overhead on small gathers,
+which is precisely what `VLLM_PLE_MMAP_PREFETCH=1` exists to hide: hash at batch-assembly time and
+overlap the gather with decode. Untested as of this writing.
+
+### 13.2 Is the table FULLY resident? No — and here is how to measure it properly
+
+Primo asked the right question ("we only use 80/122 RAM — are all tables resident?"). The honest
+answer, measured from the worker process's own page maps:
+
+```
+table on disk:              48.67 GiB   (52,259,870,014 B -- NOT the 45.6 GiB I first estimated)
+resident (worker Rss):     ~35.0-37.3 GiB   -> 72-77%
+MemAvailable:              ~41.8 GiB        -> NOT memory pressure; it is demand paging
+```
+
+**How to measure (do this, don't infer):**
+```
+docker exec <c> bash -c 'for d in /proc/[0-9]*; do p=${d#/proc/}; \
+  if grep -q ple-table $d/smaps 2>/dev/null; then \
+  awk "/ple-table/{n=1} /^Rss:/{if(n)r+=\$2} /^\$/{n=0} END{print r/1048576}" $d/smaps; fi; done'
+```
+
+**Why it is not a problem.** mmap is demand-paged: a page becomes resident when accessed, so the
+un-resident 23% is the **cold tail our traffic never requested**, not pages that were evicted.
+The proof is latency, not a percentage:
+
+| path | per-row gather | implied bandwidth (160 B rows) |
+|---|---|---|
+| prefill, resident | 3.36 us | **~47 GB/s** (LPDDR5X speed) |
+| prefill, SSD-era | ~124 us | ~1.3 GB/s (NVMe) |
+
+3.36 us/row is memory bandwidth, so every row being touched is in RAM. **The health metric is
+per-row gather latency, not residency percentage.**
+
+**Two things that do NOT work:**
+* `cat`-warming the files: 37.9 s of reading bought **0.2 GiB**. Sequential reads create inactive,
+  immediately-reclaimable pages.
+* Inferring residency from `Cached`: it sat near the table size by coincidence and I misread it as
+  residency. Always read the process's smaps.
+
+**What does help:** `drop_caches` *after* the checkpoint load (privileged container), which releases
+the ~9 GiB of dead checkpoint-shard pages that were read after PREWARM and therefore outranked the
+table in the LRU. Measured: Cached 45.31 -> 38.17 GiB, table residency 73% -> 77%.
+
+**Ceiling:** with the GPU holding ~65 GiB (weights 37 + KV pin 20 + overhead) and ~7 GiB of process
+memory, the page-cache ceiling is ~45-49 GiB against a 48.67 GiB table — so full residency is
+borderline even in principle, and would cost KV capacity to guarantee. Not worth it: the cold tail
+is free until requested.
+
+### 13.3 Second c1-c4 sweep on the pin profile (Primo, 2026-09-11 ~17:30)
+
+| depth | c1 tg | c2 | c4 | c1 pp | c1 TTFT |
+|---|---|---|---|---|---|
+| d0 | 39.2 | 64.0 | 100.7 | 3,560 | 767 ms |
+| d2048 | 41.3 | 74.5 | **116.7** | 3,158 | 1,491 ms |
+| d8192 | 38.4 | 62.6 | 94.0 | 3,207 | 3,388 ms |
+
+**Prefill is DEPTH-INVARIANT** at 3,158-3,560 t/s (baseline 1M/GMU 0.85: 1,001-1,198) — ~3x and,
+more importantly, flat. This is the direct evidence that the un-resident PLE cold tail costs
+nothing in steady state: if it did, prefill would sag with depth and it does not.
+
+**Concurrency improved as well:** c4 94.0-116.7 t/s vs 74-90 on the old config; d2048/c4 = 116.7 is
+the best aggregate this lane has recorded.
+
+**Consistent ~10% c1 decode reduction** across both pin-profile runs (38.4/39.2/40.1/40.8 vs
+43.4-45.3 baseline) — outside run variance, so probably real. Leading explanation: ~38 GiB of
+host-resident table shares the unified LPDDR5X pool the GPU reads from, costing decode bandwidth
+while leaving compute-bound prefill alone. Not yet isolated (would need the clean 512K A/B:
+GMU 0.83 vs pin). Primo's verdict: does not matter at this scale — the prefill gain dominates.
+
+**Verdict on the cold tail (Primo, agreeing with the data):** "we can't [be fully resident] but it
+likely does not matter — if they stutter then only once or rarely, not costing constant pp or tg
+speed." Recorded: residency percentage is not the target; per-row gather latency is.
+
+---
+
+## 14. YaRN scaling ladder for A5B (measured 2026-09-11, all 88 scenarios / 176 pts)
+
+temp 0, seed 42, parallel 4, TP2, MTP3, EP, pin 16g. **Only the rope config varies.**
+
+| factor | ctx | score | Hard Mode | Structured Reasoning | Multi-Step |
+|---|---|---|---|---|---|
+| **1.0 native** | 262,144 | **87** | 87% | **100%** | 88% |
+| **1.5** | 393,216 | **86** | 82% | 83% | 75% |
+| **2.0** | 524,288 | **84** | 79% | 67% | 75% |
+| 4.0 | 1,048,576 | not measured | -- | -- | -- |
+
+(TP1 native reference: 88 across three runs, sigma 0. TP2 native is 87 -- the 1-point gap is
+parallelism/numerics, and the requant is exonerated.)
+
+### Reading
+
+* **Cost is mild and roughly linear in the factor**: 1 point native -> x1.5, 2 more x1.5 -> x2.0.
+* **Sensitivity is concentrated in REASONING**, not tool use or formatting: Structured Reasoning
+  holds 100% at native, 83% at x1.5, 67% at x2.0. This is the mechanism behind Primo's
+  observation that heavy scaling is "fine for a long chat but bad for codebase or research".
+* Safety & Boundaries and Context & State barely move (73-77%, 80-85%) across the ladder.
+
+### Recommendation
+
+* **<=262K work (codebase, research, tools): native. No reason to accept any loss.**
+* **384K (x1.5): the general-purpose reach.** 1 point below native for 50% more context -- the
+  right default when a workflow genuinely needs past 262K.
+* **>=512K: reserve for long-chat/needle work** where reasoning depth matters less than reach.
+* 1M (x4.0) quality remains unmeasured; the trend gives no reason to expect it to be gentle.

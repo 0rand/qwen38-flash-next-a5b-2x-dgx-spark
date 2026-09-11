@@ -45,7 +45,7 @@ gid_index() {
         *) continue ;;
       esac
       case "$entry" in
-        0000:0000:0000:0000:0000:ffff:c0a8:*)     # <your-subnet>, IPv4-mapped
+        0000:0000:0000:0000:0000:ffff:c0a8:*)     <your-subnet>, IPv4-mapped
           echo "$g"; return 0 ;;
       esac
     done

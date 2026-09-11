@@ -400,3 +400,47 @@ parallelism/numerics, and the requant is exonerated.)
   right default when a workflow genuinely needs past 262K.
 * **>=512K: reserve for long-chat/needle work** where reasoning depth matters less than reach.
 * 1M (x4.0) quality remains unmeasured; the trend gives no reason to expect it to be gentle.
+
+---
+
+## 15. PLE PREFETCH A/B — works as designed, buys nothing when the table is resident
+
+**Setup:** identical profile (`a5b-tp2-ple-pin-384k.env`, 384K, pin 16g, EP, MTP3), one variable:
+`PLE_PREFETCH` 0 vs 1. Same perf matrix, same bench. Single runs each.
+
+**Proof the pipeline engaged (arm B):**
+```
+PLE prefetch: hook installed on prepare_inputs
+PLE table ready: layer 1, 320,001,536 rows x 160 B, backend PrefetchingMmapTable
+PLE mmap stats: ... prefetch hit 1 miss 0        (arm A, prefetch off, reports 0/0)
+```
+Note the backend differs: `PrefetchingMmapTable` (on) vs `MmapPleTable` (off). Under load arm B
+registered **thousands of hits per 30 s window (1991 -> 4250) with only 22 misses**, and `rows/op`
+fell to **0.0** — i.e. the synchronous gather path stopped being used entirely.
+(Cosmetic: vLLM logs `Unknown vLLM environment variable: VLLM_PLE_MMAP_PREFETCH`; the PLE patch
+reads its own vars directly and does not care.)
+
+**Throughput (pp2048/tg1024):**
+
+| depth | arm A c1 / c2 / c4 | arm B c1 / c2 / c4 |
+|---|---|---|
+| d0 | 29.0 / 48.3 / 76.5 | 26.9 / 49.1 / 74.0 |
+| d2048 | 35.7 / 51.2 / 69.0 | 28.5 / 57.0 / 80.3 |
+| d8192 | 36.6 / 64.6 / 77.5 | 32.6 / 65.9 / 87.3 |
+
+**Per-op PLE overhead:** arm A 5.1-9.3 ms vs arm B 5.7-11.8 ms.
+
+### Verdict: leave PLE_PREFETCH=0 (the default)
+
+* The machinery works exactly as advertised — but it exists to **hide NVMe latency**, and with the
+  table resident there is no latency to hide (gathers already run at 2-31 us/row, i.e. RAM speed).
+* **c1 decode is consistently ~7-20% lower with prefetch on** across all three depths — a real,
+  repeatable cost, not scatter. Consistent with extra machinery (worker thread, pinned buffers,
+  early hashing) on a path that was already fast enough.
+* c2/c4 are mildly better with prefetch on (up to +13% at c4/d8192); c1 is what matters for
+  interactive single-stream work, so the trade does not pay.
+
+**When it WOULD be worth enabling:** if the table cannot be resident (tight host memory, GMU held
+high, a larger table) and gathers are actually faulting to NVMe — that is the case this path was
+built for. Measure with the `PLE mmap stats` line: if `gather` ms/op is in the tens-to-hundreds
+with high per-row cost, prefetch is the tool. With RAM-speed gathers, it is pure overhead.

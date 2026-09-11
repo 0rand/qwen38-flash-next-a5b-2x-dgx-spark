@@ -4,7 +4,9 @@ Getting the azampatti/Saren **A5B INT4-AutoRound** recipe — written for a *sin
 across **two** of them with tensor parallelism, native MTP speculative decoding and working prefix
 caching. It did not work out of the box; two distinct blockers had to be solved.
 
-**→ The full write-up is [`TP2-FINDINGS.md`](TP2-FINDINGS.md). Read that first.**
+**→ Start here: [`VARIATIONS-AND-TRADEOFFS.md`](VARIATIONS-AND-TRADEOFFS.md)** — decision table per
+workflow, every knob with its measured cost, and a verification cookbook.
+**→ The bring-up story and root causes: [`TP2-FINDINGS.md`](TP2-FINDINGS.md).**
 
 ## The two blockers, in one line each
 

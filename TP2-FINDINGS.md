@@ -385,40 +385,51 @@ is not group-aligned — a much wider class than this checkpoint.
 
 ---
 
-## 12. The PLE table: why "disable SSD offload" isn't a thing (2026-09-11)
+## 12. The PLE table: it IS a budget question, not a wall (2026-09-11)
 
-**Question:** can we disable the SSD offload and mmap the PLE table (i.e. keep it in RAM)?
+**Question:** can we disable the SSD offload and keep the PLE table in RAM?
 
-**Answer: the mmap *is* the offload.** There is no separate SSD mechanism to switch off. The engine
-patch serves the 49 GB n-gram table from NVMe via `np.memmap(..., mode="r")` + `MADV_RANDOM`, with
-pinned-buffer staging to the GPU. Pages reach RAM only through the OS page cache.
+**Correction first.** An earlier version of this section claimed full RAM residency was
+impossible. That was wrong, and it came from anchoring on `GPU_MEM_UTIL=0.83` and reasoning
+outward. The table is 45.6 GiB; the question is only whether the GPU is allowed to take so
+much of the 121 GB unified pool that nothing is left for it. It is a **GMU budget**, and the
+numbers land where you'd want them:
 
-**And on GB10 it can never be fully resident**, for a hardware reason worth internalising: **the
-GPU and CPU share one 121 GB pool** (unified memory). At `GPU_MEM_UTIL=0.83` the GPU holds weights
-(37 GiB/rank) + KV (~59 GiB), leaving only ~21 GB for *everything else* — page cache included —
-against a 49 GB table. Measured live:
+| GMU | KV tokens | table cached | host free |
+|---|---|---|---|
+| 0.85 (our current default) | 3,505,062 | 22% | 10.3 GiB |
+| 0.75 | 2,779,175 | 49% | 22.4 GiB |
+| 0.65 | 2,053,289 | 76% | 34.6 GiB |
+| 0.58 | 1,545,168 | 94% | 43.1 GiB |
+| **0.55** | **1,327,402** | **100%** | **46.8 GiB** |
 
-```
-Cached: 16.1 GB   MemAvailable: 14.9 GB     <- vs a 49 GB table
-container mem: 5.4 GiB (head) / 4.9 GiB (worker)
-```
+(Derived from measured values: 36.99 GiB weights/rank, 44.7 GiB non-KV GPU footprint, and
+59,650 KV tokens per GiB. Table = 49 GB.)
 
-So roughly two-thirds of every PLE gather comes off NVMe. The engine's own telemetry shows the
-cost, serialised into decode:
+**So at GMU 0.55 the whole table is RAM-resident and you still keep 1.33M KV tokens** — which
+covers a 512K or even 750K working context with concurrency to spare. This is not a new
+capability either: the earlier FP8 lane on this hardware ran the n-gram table fully in RAM
+(the trade then was "too little cache").
 
-```
-PLE mmap stats (last 31s): 29 ops, gather 8140 ms (280.69 ms/op), 455,957 rows, 69.6 MiB read
-PLE mmap stats (last 30s): 151 ops, gather 5232 ms (34.65 ms/op), 38,464 rows, 5.9 MiB read
-```
+**Mechanism.** The mmap stays; it simply stops faulting to NVMe. `np.memmap` pages that are
+resident cost nothing extra — a tmpfs copy would consume the same unified memory with no
+benefit, so don't bother copying. Two caveats worth engineering around:
 
-**The lever is `VLLM_PLE_MMAP_PREFETCH`, and it is OFF by default** (the image documents it as
-experimental: *"1 = run the n-gram hash at batch assembly time"*). It hashes n-grams early and
-overlaps the gather with decode instead of blocking it — exactly what a 31–280 ms/op stall needs.
-Note `prefetch hit 0 miss 0` in every window above: the machinery simply never engages today.
+1. **Warm it after the checkpoint stream, not before.** Loading a 127 GB checkpoint streams
+   through the page cache and will evict table pages. `VLLM_PLE_MMAP_PREWARM=1` runs at engine
+   start; if boot order puts the weight load after it, re-touch the table afterwards. The
+   upstream disk-offload PR notes the same trap ("UNCAPPED ... checkpoint stream evicts table
+   cache; TTFT 1807-2853ms") and answers it by capping container memory, which bounds the
+   page cache the container may hold.
+2. **Consider locking it.** The container already runs with `--ulimit memlock=-1` (required for
+   RDMA), so `mlock`-based pinning of the table directory is available if the page cache proves
+   unstable under other workloads.
 
-Other knobs: `VLLM_PLE_MMAP_FAST_ROWS` (512) and `VLLM_PLE_MMAP_WORKERS` (32) — both now exposed as
-`PLE_FAST_ROWS` / `PLE_WORKERS` in the env profile.
+**Verify residency with:** `grep Cached /proc/meminfo` (expect ~45+ GiB) and the engine's own
+telemetry — `PLE mmap stats` `gather ms/op` should fall from the 31–280 ms/op we measure when
+part of the table is on NVMe.
 
-A tmpfs copy would be pointless: it consumes the same unified memory that the page cache already
-uses, with no benefit over a warm cache — and at 49 GB it would force GMU down to roughly 0.56
-(≈1.5M KV tokens instead of 3.5M) to fit alongside weights and KV.
+**`VLLM_PLE_MMAP_PREFETCH` (default 0)** remains a separate, complementary lever: it hashes
+n-grams at batch-assembly time so the gather overlaps decode instead of blocking it. With the
+table resident it matters much less; with a partially cached table it is the cheapest win.
+

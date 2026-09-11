@@ -150,11 +150,25 @@ verified, idempotent applier are in the repo (`tools/patch-gptq-moe-exclusion.py
 Worth reporting upstream: any GPTQ MoE model whose per-rank expert intermediate is not group-aligned
 hits this, so the exclusion can silently do nothing in cases well beyond this checkpoint.
 
-### And one on the PLE table
+### And one on the PLE table — it is a budget dial, not a wall
 
-If you are memory-constrained: at GMU 0.83 the PLE table **cannot** be page-cache resident. On a
-unified-memory part it shares the same pool as weights and KV — we measured 16.1 GB of cache against
-a 49 GB table, so most gathers come off NVMe. The engine's own stats show the cost (`gather`
-31–280 ms/op, serialised into decode). Note `VLLM_PLE_MMAP_PREFETCH` defaults to **0** — the
-prefetch pipeline that hashes n-grams at batch-assembly time and overlaps the gather is simply not
-enabled, and our windows report `prefetch hit 0 miss 0`. That looks like the cheapest available win.
+The 49 GB n-gram table shares the same **unified** memory pool as weights and KV on these parts, so
+whether it is resident is purely a question of how much you give the GPU:
+
+| GMU | KV tokens | table cached |
+|---|---|---|
+| 0.85 | 3,505,062 | 22% |
+| 0.65 | 2,053,289 | 76% |
+| 0.58 | 1,545,168 | 94% |
+| **0.55** | **1,327,402** | **100%** |
+
+(KV density measured at 59,650 tokens/GiB; table 45.6 GiB.) So at GMU 0.55 you get the whole table
+in RAM **and** >1.3M KV tokens — enough for a 512K–750K working context. We initially concluded the
+table could never be resident, but that was only true *at GMU 0.83*; don't generalise a constraint
+from a single operating point. A tmpfs copy is pointless — same unified memory, no benefit. Watch for
+the checkpoint load streaming through page cache and evicting table pages (`PREWARM` helps; re-touch
+or mlock after load is robust).
+
+Separately, `VLLM_PLE_MMAP_PREFETCH` defaults to **0**: the pipeline that hashes n-grams at
+batch-assembly time and overlaps the gather with decode is simply not enabled (our windows report
+`prefetch hit 0 miss 0`). With a partially cached table that's the cheapest win going.

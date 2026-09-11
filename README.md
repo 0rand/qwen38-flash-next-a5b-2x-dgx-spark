@@ -21,11 +21,24 @@ caching. It did not work out of the box; two distinct blockers had to be solved.
 
 | file | what it is |
 |---|---|
+| `ctrl.sh` + `config/a5b-tp2-512k-ep.env` | **the repeatable way in**: `./ctrl.sh start\|stop\|status\|gates\|env`, every knob from an env file. Default profile = EP + 512K + GMU 0.83 |
+| `RUNBOOK-mtp-no-ep.md` | the MTP-without-EP experiment, its three-arm design, and the measured result |
 | `TP2-FINDINGS.md` | the complete write-up: blockers, root causes, requant procedure, working recipe, measurements, 10 gotchas, guidance for new MTP/DFlash variants |
 | `tools/dequant-shared-expert.py` | the **requant**: dequantizes the blockwise-fp8 shared expert to bf16 in a new checkpoint dir (originals untouched, symlink farm + patched index) |
 | `tp2-serve.sh` / `tp2-rank.sh` | two-node launcher (head + worker over RoCE), env-driven |
 | `gate.sh` | acceptance harness — health, functional gates, and a **prefix-cache check** that reads the resolved block size from `/metrics` and probes with a diverse ≥4-block corpus |
 | `PLAN.md` | the frozen acceptance criteria written *before* the experiment (gates, decision rules, exit codes) |
+
+## Two findings worth knowing before you start
+
+* **`--enable-expert-parallel` is not optional.** Without it, *all 48* routed-expert layers fail the
+  Marlin shape check at TP2 (640/2 = 320, and `320 % group_size 128 ≠ 0`) and fall back to WNA16:
+  measured **17.7–21.8 vs 43.4–45.3 t/s** at c1, and 36 vs 90.8 at c4. Prefill is unaffected.
+  EP also happens to be what lets MTP load — but the MoE-kernel reason alone settles it.
+* **The PLE table cannot be made RAM-resident on a unified-memory GB10.** The mmap *is* the SSD
+  path, and at GMU 0.83 only ~21 GB of the shared 121 GB pool remains for page cache against a
+  49 GB table (measured 16.1 GB cached). `VLLM_PLE_MMAP_PREFETCH` defaults to **0** — the pipeline
+  that would overlap the gather with decode is not enabled.
 
 ## Verified state
 

@@ -322,3 +322,103 @@ The two walls above are **properties of the quantisation + TP sharding**, not of
   single-stream number. Do not repeat our mistake.
 
 — Canglong & Primo, 2026-09-11. Tested on 2× DGX Spark (GB10), RoCE fabric.
+
+---
+
+## 11. Does MTP need EP? No — but the MoE kernels do (measured 2026-09-11)
+
+We asked whether MTP could work at TP2 **without** `--enable-expert-parallel`, on the theory
+that the Marlin shape check only disqualified the MTP layer. Half right, and the useful half
+was wrong.
+
+### The shape check disqualifies EVERY routed-expert layer
+
+At TP2 without EP, all **48** MoE layers fail the check — not just MTP:
+
+```
+WARNING Layer 'language_model.model.layers.0.mlp.experts'  is not supported by GPTQMoeMarlin → WNA16
+...
+WARNING Layer 'language_model.model.layers.47.mlp.experts' is not supported by GPTQMoeMarlin → WNA16
+```
+
+Because each expert's `moe_intermediate_size` 640 is split to **320**, and
+`320 % max(64, group_size=128) = 64 ≠ 0`. It is the *consequence* that differs:
+
+| | routed experts (0–47) | MTP experts |
+|---|---|---|
+| checkpoint dtype | int4 GPTQ (`I32`/`F16`) | **bf16** |
+| under WNA16 | loads, silently slower | **crashes** — no `w2_weight` |
+
+So EP was never "needed for MTP". **EP is what keeps Marlin eligible across the entire MoE
+stack**; the MTP layer was merely the one that erupted instead of degrading quietly.
+
+### The cost of losing Marlin (pp2048/tg1024, c1)
+
+| arm | d0 | d2048 | d8192 |
+|---|---|---|---|
+| **EP + Marlin** | **45.3** | **43.4** | **44.3** |
+| no-EP + WNA16 | 17.7 | 21.3 | 21.8 |
+| penalty | 2.6x | 2.0x | 2.0x |
+
+At concurrency: no-EP c4 = 33.5–36.4 t/s vs **90.8** with EP at c4/d2048. **Prefill is
+unaffected** (859–1,243 vs 1,001–1,198) — this is purely the MoE kernel.
+
+### Two side results
+
+1. **MTP-without-EP is achievable** with a 3-line reorder in `auto_gptq.py`: the `RoutedExperts`
+   branch runs the shape check and returns the WNA16 fallback *before* `get_moe_quant_method()`,
+   the only code that honours `-:<regex>` dynamic exclusions. So an explicit "do not quantize this"
+   rule is shadowed by an automatic fallback — and our config already carried `-:mtp\..*`.
+   Fix + verified applier: `tools/patch-gptq-moe-exclusion.py`, mounted via `QPATCH=1`.
+   MTP then loads with **0** `w2_weight` errors and no MTP-layer warning.
+2. **EP also costs nothing in cache**: KV 3,505,062 tokens with EP vs 3,591,798 without — a 2.5%
+   difference, in favour of no-EP but far too small to offset a 2x decode penalty.
+
+### Verdict
+
+**`--enable-expert-parallel` is not optional.** It is load-bearing for MoE kernel selection,
+independent of MTP — and that reason alone settles it. The patch is a diagnostic and an upstream
+bug report, not a production change.
+
+Upstream relevance: the ordering bug affects any GPTQ MoE model whose per-rank expert intermediate
+is not group-aligned — a much wider class than this checkpoint.
+
+---
+
+## 12. The PLE table: why "disable SSD offload" isn't a thing (2026-09-11)
+
+**Question:** can we disable the SSD offload and mmap the PLE table (i.e. keep it in RAM)?
+
+**Answer: the mmap *is* the offload.** There is no separate SSD mechanism to switch off. The engine
+patch serves the 49 GB n-gram table from NVMe via `np.memmap(..., mode="r")` + `MADV_RANDOM`, with
+pinned-buffer staging to the GPU. Pages reach RAM only through the OS page cache.
+
+**And on GB10 it can never be fully resident**, for a hardware reason worth internalising: **the
+GPU and CPU share one 121 GB pool** (unified memory). At `GPU_MEM_UTIL=0.83` the GPU holds weights
+(37 GiB/rank) + KV (~59 GiB), leaving only ~21 GB for *everything else* — page cache included —
+against a 49 GB table. Measured live:
+
+```
+Cached: 16.1 GB   MemAvailable: 14.9 GB     <- vs a 49 GB table
+container mem: 5.4 GiB (head) / 4.9 GiB (worker)
+```
+
+So roughly two-thirds of every PLE gather comes off NVMe. The engine's own telemetry shows the
+cost, serialised into decode:
+
+```
+PLE mmap stats (last 31s): 29 ops, gather 8140 ms (280.69 ms/op), 455,957 rows, 69.6 MiB read
+PLE mmap stats (last 30s): 151 ops, gather 5232 ms (34.65 ms/op), 38,464 rows, 5.9 MiB read
+```
+
+**The lever is `VLLM_PLE_MMAP_PREFETCH`, and it is OFF by default** (the image documents it as
+experimental: *"1 = run the n-gram hash at batch assembly time"*). It hashes n-grams early and
+overlaps the gather with decode instead of blocking it — exactly what a 31–280 ms/op stall needs.
+Note `prefetch hit 0 miss 0` in every window above: the machinery simply never engages today.
+
+Other knobs: `VLLM_PLE_MMAP_FAST_ROWS` (512) and `VLLM_PLE_MMAP_WORKERS` (32) — both now exposed as
+`PLE_FAST_ROWS` / `PLE_WORKERS` in the env profile.
+
+A tmpfs copy would be pointless: it consumes the same unified memory that the page cache already
+uses, with no benefit over a warm cache — and at 49 GB it would force GMU down to roughly 0.56
+(≈1.5M KV tokens instead of 3.5M) to fit alongside weights and KV.

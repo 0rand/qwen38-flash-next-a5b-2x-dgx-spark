@@ -35,7 +35,7 @@ export CTX="${CTX:-262144}"                 # native; raise to 524288 once YaRN 
 export SEQS="${SEQS:-8}"
 # 2M tok -> ~62g | 1.5M -> ~47g | 1M -> ~31g.  Semantics of --kv-cache-memory-bytes under TP
 # are UNVERIFIED here: start at 62g, read "GPU KV cache size" from the log, adjust to hit 2M.
-export KV_BYTES="${KV_BYTES:-62g}"
+export KV_BYTES="${KV_BYTES-62g}"   # NOTE single dash: an EMPTY value means "GMU-driven KV" (omit the byte pin)
 export KV_DTYPE="${KV_DTYPE:-auto}"         # auto(bf16) | fp8_e4m3 (~1.9x ctx, ~10% slower)
 export MTP="${MTP:-3}"
 # A5B ships a hybrid FP8-blockwise quant (300 layers). Its SHARED-EXPERT gate_up_proj has
@@ -43,6 +43,15 @@ export MTP="${MTP:-3}"
 # creation fails. FP8_HYBRID=0 turns that patch off (layers keep their original quant).
 export FP8_HYBRID="${FP8_HYBRID:-1}"
 export EXTRA_ARGS="${EXTRA_ARGS:-}"    # pass-through for experiments (e.g. --enable-expert-parallel)
+export ALLOW_LONG="${ALLOW_LONG:-0}"
+export QPATCH="${QPATCH:-0}"           # 1 = mount patch/gptq-moe/auto_gptq.py (diagnostic)
+export PLE_PREFETCH="${PLE_PREFETCH:-0}"   # 1 = overlap PLE gather with decode (EXPERIMENTAL)
+export PLE_WORKERS="${PLE_WORKERS:-32}"
+export PLE_FAST_ROWS="${PLE_FAST_ROWS:-512}"
+# ROPE is a JSON blob (--hf-overrides). It CANNOT be shipped as a raw env line: rank_env emits
+# unquoted `env | grep` values, and the ssh->bash hop flattened it into 'a:b:c' on the worker
+# (seen as pydantic hf_overrides dict_type error). Base64 is metacharacter-free, so it survives.
+export ROPE_B64="$(printf %s "${ROPE:-}" | base64 -w0)"   # 1 = allow max-model-len beyond the checkpoint native ctx (needed for YaRN 1M)
 export BATCHED_TOKENS="${BATCHED_TOKENS:-8192}"
 export GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.01}" # tiny on purpose: KV_BYTES sets the cache
 export SHM="${SHM:-16g}"
@@ -75,7 +84,7 @@ export ROPE
 
 rank_env() {
   # One VAR=value per line, exported for the remote shell.
-  env | grep -E '^(IMAGE|CONTAINER|SERVED_NAME|PORT|MODELS_DIR|MODEL_DIR|TABLE_DIR|DRAFT_DIR|TP_SIZE|CTX|SEQS|KV_BYTES|KV_DTYPE|MTP|FP8_HYBRID|EXTRA_ARGS|BATCHED_TOKENS|GPU_MEM_UTIL|SHM|HEAD_ROCE_IP|WORKER_ROCE_IP|NCCL_IB_HCA|NCCL_SOCKET_IFNAME|CONTROL_IF|MASTER_ADDR|MASTER_PORT|ROPE)=' | sed 's/^/export /'
+  env | grep -E '^(IMAGE|CONTAINER|SERVED_NAME|PORT|MODELS_DIR|MODEL_DIR|TABLE_DIR|DRAFT_DIR|TP_SIZE|CTX|SEQS|KV_BYTES|KV_DTYPE|MTP|FP8_HYBRID|EXTRA_ARGS|ALLOW_LONG|QPATCH|PLE_PREFETCH|PLE_WORKERS|PLE_FAST_ROWS|BATCHED_TOKENS|GPU_MEM_UTIL|SHM|HEAD_ROCE_IP|WORKER_ROCE_IP|NCCL_IB_HCA|NCCL_SOCKET_IFNAME|CONTROL_IF|MASTER_ADDR|MASTER_PORT|ROPE_B64)=' | sed 's/^/export /'
 }
 
 run_local() { bash "$RANK_SH" "$1" "$2"; }
@@ -84,6 +93,8 @@ run_remote() {
   local rank="$1" headless="$2"
   ssh -o ConnectTimeout=10 "$WORKER_SSH" "mkdir -p '$WORKER_DIR'"
   rsync -a "$RANK_SH" "$WORKER_SSH:$WORKER_DIR/tp2-rank.sh"
+  # the rank script resolves patch files relative to its OWN dir, so the tree must exist on the worker
+  rsync -a --delete "$HERE/patch/" "$WORKER_SSH:$WORKER_DIR/patch/"
   { rank_env; echo "bash $WORKER_DIR/tp2-rank.sh $rank $headless"; } | ssh "$WORKER_SSH" 'bash -s'
 }
 
